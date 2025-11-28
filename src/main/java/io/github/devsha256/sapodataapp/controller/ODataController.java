@@ -1,6 +1,6 @@
 package io.github.devsha256.sapodataapp.controller;
 
-import io.github.devsha256.sapodataapp.dto.ODataConnection;
+import io.github.devsha256.sapodataapp.dto.ODataMetadataRequest;
 import io.github.devsha256.sapodataapp.dto.ODataQueryRequest;
 import io.github.devsha256.sapodataapp.model.PropertyInfo;
 import io.github.devsha256.sapodataapp.service.ODataGatewayService;
@@ -24,16 +24,18 @@ public class ODataController {
 
     /**
      * POST /api/odata/metadata
-     * Request: { url, username, password }
-     * Response: Map<EntitySetName, List<PropertyInfo>>
+     * Request: { url, username, password, entitySet? }
+     * If entitySet is present, returns only that entity's required properties.
      */
     @PostMapping("/metadata")
-    public ResponseEntity<?> metadata(@RequestBody @Valid ODataConnection connection) {
+    public ResponseEntity<?> metadata(@RequestBody @Valid ODataMetadataRequest request) {
         try {
-            Map<String, List<PropertyInfo>> metadata = gatewayService.fetchMetadata(connection);
+            Map<String, List<PropertyInfo>> metadata = gatewayService.fetchMetadata(request);
             return ResponseEntity.ok(metadata);
         } catch (IllegalArgumentException iae) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("error", iae.getMessage()));
+        } catch (ODataGatewayService.EntityNotFoundException enf) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", enf.getMessage()));
         } catch (Exception e) {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
         }

@@ -9,26 +9,36 @@ import com.sap.cloud.sdk.cloudplatform.connectivity.HttpDestination;
 import io.github.devsha256.sapodataapp.dto.ODataConnection;
 import io.github.devsha256.sapodataapp.dto.ODataQueryRequest;
 import io.github.devsha256.sapodataapp.model.PropertyInfo;
+import org.apache.http.HttpResponse;
+import org.apache.http.auth.AUTH;
 import org.apache.http.client.HttpClient;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
+import org.apache.http.conn.ssl.NoopHostnameVerifier;
+import org.apache.http.conn.ssl.TrustStrategy;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.ssl.SSLContextBuilder;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
 import org.xml.sax.InputSource;
 
+import javax.net.ssl.SSLContext;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.InputStream;
 import java.io.StringReader;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.stream.Collectors;
+import java.util.Base64;
+import com.fasterxml.jackson.databind.JsonMappingException;
 
 /**
- * Service that handles metadata and query requests using SAP Cloud SDK HTTP destination.
- * Uses Apache HttpClient v4 types since HttpClientAccessor returns v4 client.
+ * OData gateway service with optional "insecure/trust-all TLS" mode for local testing.
  */
 @Service
 public class ODataGatewayService {
@@ -36,26 +46,41 @@ public class ODataGatewayService {
     private final ObjectMapper mapper = new ObjectMapper();
 
     /**
-     * Fetches metadata from the OData service and extracts a map of EntitySet -> required properties.
-     * Required properties are considered those with Nullable="false".
+     * Toggle for using an insecure "trust-all" TLS HttpClient (dev-only).
+     * Configure via application.properties: app.security.insecure-trust-all=true
+     */
+    private final boolean insecureTrustAll;
+
+    public ODataGatewayService(@Value("${app.security.insecure-trust-all:false}") boolean insecureTrustAll) {
+        this.insecureTrustAll = insecureTrustAll;
+    }
+
+    /**
+     * Fetch metadata and parse required properties per entity set.
      */
     public Map<String, List<PropertyInfo>> fetchMetadata(ODataConnection conn) {
         try {
+            // build destination (used for URL normalization or other metadata if needed)
             var destination = buildDestination(conn.url(), conn.username(), conn.password());
-            HttpClient client = HttpClientAccessor.getHttpClient(destination);
+            HttpClient client = chooseHttpClient(destination, conn);
 
             String metadataUrl = normalizeBaseUrl(conn.url());
             if (!metadataUrl.endsWith("/")) metadataUrl = metadataUrl + "/";
             metadataUrl = metadataUrl + "$metadata";
 
             HttpGet get = new HttpGet(URI.create(metadataUrl));
-            try (CloseableHttpResponse response = (CloseableHttpResponse) client.execute(get)) {
+            // when using insecure client we set Basic header manually
+            if (insecureTrustAll) {
+                addBasicAuth(get, conn.username(), conn.password());
+            }
+
+            try (CloseableHttpResponse response = (CloseableHttpResponse) (client instanceof CloseableHttpClient ? ((CloseableHttpClient) client).execute(get) : HttpClients.createDefault().execute(get))) {
                 int status = response.getStatusLine().getStatusCode();
                 if (status >= 400) {
                     throw new RuntimeException("Failed to fetch metadata: HTTP " + status);
                 }
                 InputStream content = response.getEntity().getContent();
-                String xml = new String(content.readAllBytes());
+                String xml = new String(content.readAllBytes(), StandardCharsets.UTF_8);
                 return parseMetadataXml(xml);
             }
         } catch (Exception e) {
@@ -64,20 +89,23 @@ public class ODataGatewayService {
     }
 
     /**
-     * Query an entity set with optional query options. Returns a list of generic maps (records).
+     * Query an entity set, handling OData V2/V4 shapes.
      */
     public List<Map<String, Object>> queryEntitySet(ODataQueryRequest req) {
         try {
             var destination = buildDestination(req.url(), req.username(), req.password());
-            HttpClient client = HttpClientAccessor.getHttpClient(destination);
-
+            HttpClient client = chooseHttpClient(destination, new ODataConnection(req.url(), req.username(), req.password()));
             String base = normalizeBaseUrl(req.url());
             if (!base.endsWith("/")) base = base + "/";
             String target = base + encodeSegment(req.entitySet());
             String query = req.queryOptions() == null ? "" : (req.queryOptions().startsWith("?") ? req.queryOptions() : "?" + req.queryOptions());
 
             HttpGet get = new HttpGet(URI.create(target + query));
-            try (CloseableHttpResponse response = (CloseableHttpResponse) client.execute(get)) {
+            if (insecureTrustAll) {
+                addBasicAuth(get, req.username(), req.password());
+            }
+
+            try (CloseableHttpResponse response = (CloseableHttpResponse) (client instanceof CloseableHttpClient ? ((CloseableHttpClient) client).execute(get) : HttpClients.createDefault().execute(get))) {
                 int status = response.getStatusLine().getStatusCode();
                 if (status >= 400) {
                     throw new RuntimeException("Request failed with HTTP " + status);
@@ -112,12 +140,24 @@ public class ODataGatewayService {
 
                 return Collections.emptyList();
             }
+        } catch (JsonMappingException jm) {
+            throw new RuntimeException("Failed to map JSON: " + jm.getMessage(), jm);
         } catch (Exception e) {
             throw new RuntimeException("Unable to query entity set: " + e.getMessage(), e);
         }
     }
 
     // --- helpers ---
+
+    private HttpClient chooseHttpClient(HttpDestination destination, ODataConnection conn) {
+        if (insecureTrustAll) {
+            // create and return an HTTP client that trusts all certs
+            return createTrustAllClient();
+        } else {
+            // use SAP Cloud SDK provided http client (v4 HttpClient)
+            return HttpClientAccessor.getHttpClient(destination);
+        }
+    }
 
     private HttpDestination buildDestination(String url, String user, String password) {
         try {
@@ -138,6 +178,36 @@ public class ODataGatewayService {
         return seg.replace(" ", "%20");
     }
 
+    private void addBasicAuth(HttpGet get, String user, String pass) {
+        if (user == null) user = "";
+        if (pass == null) pass = "";
+        String token = Base64.getEncoder().encodeToString((user + ":" + pass).getBytes(StandardCharsets.UTF_8));
+        get.addHeader("Authorization", "Basic " + token);
+    }
+
+    /**
+     * Create an Apache HTTP client (v4) that trusts all certificates and disables hostname verification.
+     * WARNING: insecure. Use only for local testing.
+     */
+    private CloseableHttpClient createTrustAllClient() {
+        try {
+            TrustStrategy acceptingTrustStrategy = (cert, authType) -> true;
+            SSLContext sslContext = SSLContextBuilder.create()
+                    .loadTrustMaterial(null, acceptingTrustStrategy)
+                    .build();
+
+            return HttpClients.custom()
+                    .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+                    .setSSLContext(sslContext)
+                    .build();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create trust-all HTTP client: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Parses metadata XML and extracts required properties (as before).
+     */
     private Map<String, List<PropertyInfo>> parseMetadataXml(String xml) {
         try {
             DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
